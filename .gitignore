@@ -3,6 +3,7 @@ config.h.in~
 /dbg/
 /release/
 /build/
+/cmake-build-*/
 /autom4te.cache/
 .cproject
 .project
