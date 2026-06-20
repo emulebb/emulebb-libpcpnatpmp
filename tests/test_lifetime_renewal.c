@@ -16,6 +16,7 @@
 #include "default_config.h"
 #endif
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #ifndef WIN32
@@ -24,6 +25,8 @@
 #include <sys/socket.h>
 #endif
 #include "pcpnatpmp.h"
+
+#include "test_pcp_server_helper.h"
 
 #include "pcp_socket.h"
 #include "pcp_utils.h"
@@ -35,9 +38,11 @@
 #define KRED "\x1B[31m"
 #define KGRN "\x1B[32m"
 
-static pcp_fstate_e test_wait(pcp_flow_t *flow, int timeout) {
+static pcp_fstate_e test_wait(pcp_flow_t *flow, int timeout,
+                              test_pcp_server_sequence_t *sequence) {
     fd_set read_fds;
     int fdmax;
+    PCP_SOCKET sock;
     struct timeval tout_end;
     struct timeval tout_select;
     int nflow_exit_states = pcp_eval_flow_state(flow, NULL);
@@ -66,8 +71,14 @@ static pcp_fstate_e test_wait(pcp_flow_t *flow, int timeout) {
             return pcp_state_processing;
         }
 
+        if (sequence && test_pcp_server_sequence_pulse(sequence, 0) < 0) {
+            return pcp_state_failed;
+        }
         // process all events and get timeout value for next select
         pcp_pulse(ctx, &tout_select);
+        if (sequence && test_pcp_server_sequence_pulse(sequence, 0) < 0) {
+            return pcp_state_failed;
+        }
 
         // check flow for reaching one of exit from wait states
         // (also handles case when flow is MAP for 0.0.0.0)
@@ -75,8 +86,21 @@ static pcp_fstate_e test_wait(pcp_flow_t *flow, int timeout) {
             return ret_state;
         }
 
+        if (sequence && test_pcp_server_sequence_is_active(sequence)) {
+            struct timeval server_slice;
+            server_slice.tv_sec = 0;
+            server_slice.tv_usec = 100000;
+            if (timeval_comp(&server_slice, &tout_select) < 0) {
+                tout_select = server_slice;
+            }
+        }
+
         FD_ZERO(&read_fds);
-        fdmax = pcp_get_socket(ctx);
+        sock = pcp_get_socket(ctx);
+        if (sock > INT_MAX - 1) {
+            return pcp_state_failed;
+        }
+        fdmax = (int)sock;
         FD_SET(fdmax, &read_fds);
         fdmax++;
 
@@ -103,6 +127,8 @@ int main(int argc, char *argv[] UNUSED) {
     uint8_t protocol = 6;
     uint32_t lifetime = 10;
     pcp_ctx_t *ctx;
+    test_pcp_server_config_t server_configs[2];
+    test_pcp_server_sequence_t server_sequence;
 
     //    pcp_log_level = PCP_LOGLVL_DEBUG;
 
@@ -134,6 +160,19 @@ int main(int argc, char *argv[] UNUSED) {
 
     pcp_log_level = argc > 1 ? PCP_LOGLVL_DEBUG : PCP_LOGLVL_INFO;
 
+    test_pcp_server_config_init(&server_configs[0]);
+    server_configs[0].server_port = "5351";
+    server_configs[0].server_address = "0.0.0.0";
+    server_configs[0].server_info.end_after_recv = 4;
+
+    test_pcp_server_config_init(&server_configs[1]);
+    server_configs[1].server_port = "5351";
+    server_configs[1].server_address = "0.0.0.0";
+    server_configs[1].server_info.end_after_recv = 1;
+
+    test_pcp_server_sequence_init(&server_sequence, server_configs, 2);
+    test_sleep_ms(100);
+
     ctx = pcp_init(0, NULL);
     pcp_add_server(ctx, Sock_pton("127.0.0.1"), 2);
 
@@ -145,7 +184,8 @@ int main(int argc, char *argv[] UNUSED) {
 
     while ((cur_time = time(NULL)) < finish_time) {
 
-        switch (test_wait(flow, (int)(finish_time - cur_time + 1) * 1000)) {
+        switch (test_wait(flow, (int)(finish_time - cur_time + 1) * 1000,
+                          &server_sequence)) {
         case pcp_state_processing:
             printf("\nFlow signaling timed out.\n" KNRM);
             break;
@@ -167,6 +207,7 @@ int main(int argc, char *argv[] UNUSED) {
     pcp_delete_flow(flow);
     flow = NULL;
     pcp_terminate(ctx, 1);
+    test_pcp_server_sequence_stop(&server_sequence);
 
     PD_SOCKET_CLEANUP();
 
